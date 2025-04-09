@@ -7,10 +7,7 @@ from torcheeg.datasets.constants import \
     DEAP_CHANNEL_LOCATION_DICT
 
 
-# 设置 HTTP 代理
-os.environ['http_proxy'] = 'http://192.168.32.28:18000'
-# 设置 HTTPS 代理
-os.environ['https_proxy'] = 'http://192.168.32.28:18000'
+
 
 
 dataset = DEAPDataset(
