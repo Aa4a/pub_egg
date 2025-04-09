@@ -1,2 +1,3 @@
-脑电信号学习
-目的是将脑电信号训练为文字语言，与chaigpt交互
+只有单一运动信号
+没有序列数据
+https://torcheeg.readthedocs.io/
