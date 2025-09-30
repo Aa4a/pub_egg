@@ -181,24 +181,32 @@ p_fake = discriminator(fake_X)
 
 
 #%%
-import torch
-from torch.utils.data import DataLoader
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader
 from accelerate import Accelerator
 from tqdm import tqdm
-
 from torcheeg.datasets import DEAPDataset
 from torcheeg import transforms
 from torcheeg.datasets.constants import DEAP_CHANNEL_LOCATION_DICT
+import torch.backends.cudnn as cudnn
 from torcheeg.model_selection import KFoldGroupbyTrial
 from torcheeg.models import CCNN
+import torch.multiprocessing as mp
+import torch
+import gc
+import os
 
+# ================== 系统优化 ==================
+cudnn.benchmark = True   # 对固定输入大小的 CNN 加速
 
-# ================== 准备数据集 ==================
+# ================== 强制使用 spawn 启动方式（关键修复）==================
+mp.set_start_method('spawn', force=True)
+
+# ================== 数据集 ==================
 dataset = DEAPDataset(
-    io_path='/pub_egg/dateset/examples_trainers_1/deap',
-    root_path='/pub_egg/dateset/deap_set/data_preprocessed_python',
+    io_path='/media/damoxing/waibao/Carlos/pub_egg/dateset/examples_trainers_1/deap',
+    root_path='/media/damoxing/waibao/Carlos/pub_egg/dateset/deap_set/data_preprocessed_python',
     offline_transform=transforms.Compose([
         transforms.BandDifferentialEntropy(apply_to_baseline=True),
         transforms.ToGrid(DEAP_CHANNEL_LOCATION_DICT, apply_to_baseline=True)
@@ -211,27 +219,76 @@ dataset = DEAPDataset(
         transforms.Select('valence'),
         transforms.Binary(5.0),
     ]),
-    num_worker=64
+    num_worker=0  # 注意：这里设为 0，避免预处理时多进程崩溃
 )
 
-# ================== 定义 KFold ==================
+# ================== KFold ==================
 k_fold = KFoldGroupbyTrial(
     n_splits=18,
-    split_path='/pub_egg/dateset/examples_trainers_1/split',
+    split_path='/media/damoxing/waibao/Carlos/pub_egg/dateset/examples_trainers_1/split',
     shuffle=True,
     random_state=42
 )
 
 # ================== Accelerator ==================
-accelerator = Accelerator()
+accelerator = Accelerator(mixed_precision="fp16")   # 开启混合精度
+
+# ================== 自动寻找最大 batch size ==================
+def find_max_batch_size(train_dataset, val_dataset, start_bs=64, max_bs=1024):
+    device = accelerator.device
+    bs = start_bs
+    last_success_bs = bs
+    while bs <= max_bs:
+        try:
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=bs,  # ⚠️ 关键：不是 max_bs，而是当前测试的 bs
+                shuffle=True,
+                num_workers=0,  # 必须为 0，避免多进程崩溃
+                pin_memory=True,
+                persistent_workers=False
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=bs,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=True,
+                persistent_workers=False
+            )
+
+            # 创建并移动模型到设备
+            model = CCNN(num_classes=2, in_channels=4, grid_size=(9, 9)).to(device)
+            x, y = next(iter(train_loader))
+            x, y = x.to(device), y.to(device)
+            with torch.no_grad():
+                _ = model(x)  # forward 一次看看是否 OOM 或崩溃
+
+            last_success_bs = bs
+            bs *= 2  # 二分增长
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                torch.cuda.empty_cache()
+                break
+            else:
+                print(f"[Batch Size Test] Error at bs={bs}: {e}")
+                break
+        except Exception as e:
+            print(f"[Batch Size Test] Unexpected error at bs={bs}: {e}")
+            break
+
+    return last_success_bs
 
 # ================== 训练循环 ==================
 def train_one_fold(train_loader, val_loader, fold_idx, accelerator):
     model = CCNN(num_classes=2, in_channels=4, grid_size=(9, 9))
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    model = torch.compile(model)   # PyTorch 2.x 编译模式
 
-    # 用 accelerate 包装
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+
+    # ✅ 让 Accelerator 自动准备模型、优化器、数据加载器、并管理 scaler
     model, optimizer, train_loader, val_loader = accelerator.prepare(
         model, optimizer, train_loader, val_loader
     )
@@ -241,13 +298,18 @@ def train_one_fold(train_loader, val_loader, fold_idx, accelerator):
         # ---- 训练 ----
         model.train()
         total_loss = 0.0
-        for batch in tqdm(train_loader, disable=not accelerator.is_local_main_process):
-            x, y = batch
+        for x, y in tqdm(train_loader, disable=not accelerator.is_local_main_process):
             optimizer.zero_grad()
-            outputs = model(x)
-            loss = criterion(outputs, y)
+
+            # ✅ 使用 accelerator.autocast() 自动管理混合精度
+            with accelerator.autocast():
+                outputs = model(x)
+                loss = criterion(outputs, y)
+
+            # ✅ Accelerator 自动处理 scale + backward + step
             accelerator.backward(loss)
             optimizer.step()
+
             total_loss += loss.item()
 
         avg_loss = total_loss / len(train_loader)
@@ -255,9 +317,8 @@ def train_one_fold(train_loader, val_loader, fold_idx, accelerator):
         # ---- 验证 ----
         model.eval()
         correct, total = 0, 0
-        with torch.no_grad():
-            for batch in val_loader:
-                x, y = batch
+        with torch.no_grad(), accelerator.autocast():
+            for x, y in val_loader:
                 outputs = model(x)
                 preds = outputs.argmax(dim=1)
                 correct += (preds == y).sum().item()
@@ -266,26 +327,37 @@ def train_one_fold(train_loader, val_loader, fold_idx, accelerator):
         acc = correct / total if total > 0 else 0
         accelerator.print(f"[Fold {fold_idx}] Epoch {epoch+1} | Loss={avg_loss:.4f} | Val Acc={acc:.4f}")
 
-        # 保存最好模型
         if acc > best_acc and accelerator.is_local_main_process:
-            torch.save(model.state_dict(),
-                       f'/pub_egg/dateset/examples_trainers_1/model/fold_{fold_idx}_best.pt')
+            save_path = f'/media/damoxing/waibao/Carlos/pub_egg/dateset/examples_trainers_1/model/fold_{fold_idx}_best.pt'
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            torch.save(model.state_dict(), save_path)
             best_acc = acc
 
     return best_acc
 
-#%%
-# ================== 交叉验证 ==================
+# ================== 主训练流程 ==================
 all_scores = []
 for i, (train_dataset, val_dataset) in enumerate(k_fold.split(dataset)):
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+    # 自动找最大 batch size
+    max_bs = find_max_batch_size(train_dataset, val_dataset, start_bs=64, max_bs=1024)
+    accelerator.print(f"[Fold {i}] Using batch size = {max_bs}")
+
+    # 使用 num_workers=0 的 DataLoader
+    train_loader = DataLoader(train_dataset, batch_size=max_bs, shuffle=True,
+                              num_workers=0, pin_memory=True, persistent_workers=False)
+    val_loader = DataLoader(val_dataset, batch_size=max_bs, shuffle=False,
+                            num_workers=0, pin_memory=True, persistent_workers=False)
 
     score = train_one_fold(train_loader, val_loader, i, accelerator)
     accelerator.print(f"Fold {i} Best Val Accuracy: {score:.4f}")
     all_scores.append(score)
 
+    # 清理显存和缓存，防止累积
+    torch.cuda.empty_cache()
+    gc.collect()
+
 accelerator.print(f"Average Accuracy over {len(all_scores)} folds: {sum(all_scores)/len(all_scores):.4f}")
+
 
 
 #%%
@@ -384,8 +456,8 @@ import pytorch_lightning as pl
 import ipdb
 
 dataset = DEAPDataset(
-    io_path=f'/pub_egg/dateset/deap_set/examples_trainers_2/deap',
-    root_path='/pub_egg/dateset/deap_set/data_preprocessed_python',
+    io_path=f'/media/damoxing/waibao/Carlos/pub_egg/dateset/deap_set/examples_trainers_2/deap',
+    root_path='/media/damoxing/waibao/Carlos/pub_egg/dateset/deap_set/data_preprocessed_python',
     offline_transform=transforms.Compose([
         transforms.BandDifferentialEntropy(apply_to_baseline=True),
         transforms.ToGrid(DEAP_CHANNEL_LOCATION_DICT, apply_to_baseline=True)
@@ -400,7 +472,7 @@ dataset = DEAPDataset(
     num_worker=8)
 
 
-k_fold = LeaveOneSubjectOut(split_path='/pub_egg/dateset/deap_set/examples_trainers_2/split')
+k_fold = LeaveOneSubjectOut(split_path='/media/damoxing/waibao/Carlos/pub_egg/dateset/deap_set/examples_trainers_2/split')
 
 
 class Extractor(CCNN):
@@ -437,8 +509,8 @@ for i, (train_dataset, val_dataset) in enumerate(k_fold.split(dataset)):
     trainer.fit(source_loader,
                 target_loader,
                 target_loader,
-                max_epochs=1,
-                default_root_dir=f'/pub_egg/examples_trainers_2/model/{i}',
+                max_epochs=10,
+                default_root_dir=f'/media/damoxing/waibao/Carlos/pub_egg/examples_trainers_2/model/{i}',
                 callbacks=[pl.callbacks.ModelCheckpoint(save_last=True)],
                 enable_progress_bar=True,
                 enable_model_summary=True,
