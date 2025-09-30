@@ -205,8 +205,8 @@ mp.set_start_method('spawn', force=True)
 
 # ================== 数据集 ==================
 dataset = DEAPDataset(
-    io_path='/media/damoxing/waibao/Carlos/pub_egg/dateset/examples_trainers_1/deap',
-    root_path='/media/damoxing/waibao/Carlos/pub_egg/dateset/deap_set/data_preprocessed_python',
+    io_path='/pub_egg/dateset/examples_trainers_1/deap',
+    root_path='/pub_egg/dateset/deap_set/data_preprocessed_python',
     offline_transform=transforms.Compose([
         transforms.BandDifferentialEntropy(apply_to_baseline=True),
         transforms.ToGrid(DEAP_CHANNEL_LOCATION_DICT, apply_to_baseline=True)
@@ -225,7 +225,7 @@ dataset = DEAPDataset(
 # ================== KFold ==================
 k_fold = KFoldGroupbyTrial(
     n_splits=18,
-    split_path='/media/damoxing/waibao/Carlos/pub_egg/dateset/examples_trainers_1/split',
+    split_path='/pub_egg/dateset/examples_trainers_1/split',
     shuffle=True,
     random_state=42
 )
@@ -328,7 +328,7 @@ def train_one_fold(train_loader, val_loader, fold_idx, accelerator):
         accelerator.print(f"[Fold {fold_idx}] Epoch {epoch+1} | Loss={avg_loss:.4f} | Val Acc={acc:.4f}")
 
         if acc > best_acc and accelerator.is_local_main_process:
-            save_path = f'/media/damoxing/waibao/Carlos/pub_egg/dateset/examples_trainers_1/model/fold_{fold_idx}_best.pt'
+            save_path = f'/pub_egg/dateset/examples_trainers_1/model/fold_{fold_idx}_best.pt'
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save(model.state_dict(), save_path)
             best_acc = acc
@@ -456,8 +456,8 @@ import pytorch_lightning as pl
 import ipdb
 
 dataset = DEAPDataset(
-    io_path=f'/media/damoxing/waibao/Carlos/pub_egg/dateset/deap_set/examples_trainers_2/deap',
-    root_path='/media/damoxing/waibao/Carlos/pub_egg/dateset/deap_set/data_preprocessed_python',
+    io_path=f'/pub_egg/dateset/deap_set/examples_trainers_2/deap',
+    root_path='/pub_egg/dateset/deap_set/data_preprocessed_python',
     offline_transform=transforms.Compose([
         transforms.BandDifferentialEntropy(apply_to_baseline=True),
         transforms.ToGrid(DEAP_CHANNEL_LOCATION_DICT, apply_to_baseline=True)
@@ -472,7 +472,7 @@ dataset = DEAPDataset(
     num_worker=8)
 
 
-k_fold = LeaveOneSubjectOut(split_path='/media/damoxing/waibao/Carlos/pub_egg/dateset/deap_set/examples_trainers_2/split')
+k_fold = LeaveOneSubjectOut(split_path='/pub_egg/dateset/deap_set/examples_trainers_2/split')
 
 
 class Extractor(CCNN):
@@ -510,7 +510,7 @@ for i, (train_dataset, val_dataset) in enumerate(k_fold.split(dataset)):
                 target_loader,
                 target_loader,
                 max_epochs=10,
-                default_root_dir=f'/media/damoxing/waibao/Carlos/pub_egg/examples_trainers_2/model/{i}',
+                default_root_dir=f'/pub_egg/examples_trainers_2/model/{i}',
                 callbacks=[pl.callbacks.ModelCheckpoint(save_last=True)],
                 enable_progress_bar=True,
                 enable_model_summary=True,
