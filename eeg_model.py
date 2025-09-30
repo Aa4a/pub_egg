@@ -365,3 +365,86 @@ if __name__ == "__main__":
         output = model(x)
         pred = output.argmax(dim=1).item()
     print(f"Sample true label: {y}, predicted: {pred}")
+
+
+
+#%%
+from torcheeg.datasets import DEAPDataset
+from torcheeg import transforms
+
+from torcheeg.model_selection import LeaveOneSubjectOut
+from torcheeg.datasets.constants import \
+    DEAP_CHANNEL_LOCATION_DICT
+from torch.utils.data import DataLoader
+from torcheeg.models import CCNN
+
+from torcheeg.trainers import CORALTrainer
+
+import pytorch_lightning as pl
+import ipdb
+
+dataset = DEAPDataset(
+    io_path=f'/pub_egg/dateset/deap_set/examples_trainers_2/deap',
+    root_path='/pub_egg/dateset/deap_set/data_preprocessed_python',
+    offline_transform=transforms.Compose([
+        transforms.BandDifferentialEntropy(apply_to_baseline=True),
+        transforms.ToGrid(DEAP_CHANNEL_LOCATION_DICT, apply_to_baseline=True)
+    ]),
+    online_transform=transforms.Compose(
+        [transforms.BaselineRemoval(),
+         transforms.ToTensor()]),
+    label_transform=transforms.Compose([
+        transforms.Select('valence'),
+        transforms.Binary(5.0),
+    ]),
+    num_worker=8)
+
+
+k_fold = LeaveOneSubjectOut(split_path='/pub_egg/dateset/deap_set/examples_trainers_2/split')
+
+
+class Extractor(CCNN):
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.conv4(x)
+        x = x.flatten(start_dim=1)
+        return x
+
+
+class Classifier(CCNN):
+    def forward(self, x):
+        x = self.lin1(x)
+        x = self.lin2(x)
+        return x
+
+#%%
+for i, (train_dataset, val_dataset) in enumerate(k_fold.split(dataset)):
+    ipdb.set_trace()
+    source_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    target_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+
+    extractor = Extractor(in_channels=4, num_classes=2)
+    classifier = Classifier(in_channels=4, num_classes=2)
+
+    trainer = CORALTrainer(extractor=extractor,
+                                classifier=classifier,
+                                num_classes=2,
+                                lr=1e-4,
+                                weight_decay=0.0,
+                                accelerator='gpu')
+    trainer.fit(source_loader,
+                target_loader,
+                target_loader,
+                max_epochs=1,
+                default_root_dir=f'/pub_egg/examples_trainers_2/model/{i}',
+                callbacks=[pl.callbacks.ModelCheckpoint(save_last=True)],
+                enable_progress_bar=True,
+                enable_model_summary=True,
+                limit_val_batches=0.0)
+    score = trainer.test(target_loader,
+                         enable_progress_bar=True,
+                         enable_model_summary=True)[0]
+    print(f'Fold {i} test accuracy: {score["test_accuracy"]:.4f}')
+
