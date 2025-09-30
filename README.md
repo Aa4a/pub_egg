@@ -3,3 +3,5 @@
 未来使用序列数据，希望使用自然语言的脑电信号
 
 pytorch工具：https://torcheeg.readthedocs.io/
+
+data: https://huggingface.co/datasets/as674262040/pub_eeg
