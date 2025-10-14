@@ -4,4 +4,4 @@
 
 pytorch工具：https://torcheeg.readthedocs.io/
 
-data: https://huggingface.co/datasets/as674262040/pub_eeg
+hf dataset: https://huggingface.co/datasets/as674262040/pub_eeg
